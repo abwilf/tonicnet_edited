@@ -27,6 +27,8 @@ N_CHORD = 50
 N_TOKENS = N_PITCH + N_CHORD
 
 
+USE_MASK = True
+
 def get_data_set(mode, shuffle_batches=True, return_I=False):
 
     if mode == 'train':
@@ -48,26 +50,66 @@ def get_data_set(mode, shuffle_batches=True, return_I=False):
     if shuffle_batches:
         lst = sample(lst, len(lst))
 
+    tot_X, tot_Y, tot_P, tot_I, tot_C, tot_mask = [], [], [], [], [], []
+    
     for file_name in lst:
         if torch.cuda.is_available():
             X = torch.load(f'{parent_dir}/X_cuda/{file_name}')
             Y = torch.load(f'{parent_dir}/Y_cuda/{file_name}')
             P = torch.load(f'{parent_dir}/P_cuda/{file_name}')
+            
+            # choose voice
+            masked_voice = np.random.choice(np.arange(1,5))
+            mask = np.ones(X.reshape(-1,5).shape)
+            
+            if USE_MASK:
+                mask[:,masked_voice] = 0
+            
+            mask = mask.reshape(X.shape) # flatten out like X
+
+            tot_X.append(X)
+            tot_Y.append(Y)
+            tot_P.append(P)
+            tot_mask.append(torch.from_numpy(mask).to(torch.bool).cuda())
+
             if return_I:
                 I = torch.load(f'{parent_dir}/I_cuda/{file_name}')
                 C = torch.load(f'{parent_dir}/C_cuda/{file_name}')
+                tot_I.append(I)
+                tot_C.append(C)
         else:
             X = torch.load(f'{parent_dir}/X/{file_name}')
             Y = torch.load(f'{parent_dir}/Y/{file_name}')
             P = torch.load(f'{parent_dir}/P/{file_name}')
+            
+            # choose voice
+            masked_voice = np.random.choice(np.arange(1,5))
+            mask = np.ones(X.reshape(-1,5).shape)
+            mask[:,masked_voice] = 0
+            mask = mask.reshape(X.shape) # flatten out like X
+
+            tot_X.append(X)
+            tot_Y.append(Y)
+            tot_P.append(P)
+            tot_mask.append(torch.from_numpy(mask).to(torch.bool).cuda())
+
             if return_I:
                 I = torch.load(f'{parent_dir}/I/{file_name}')
                 C = torch.load(f'{parent_dir}/C/{file_name}')
+                tot_I.append(I)
+                tot_C.append(C)
 
-        if return_I:
-            yield X, Y, P, I, C
-        else:
-            yield X, Y, P
+        # if return_I:
+        #     yield X, Y, P, I, C
+        # else:
+        #     yield X, Y, P
+
+    if return_I:
+        return ( (x,y,p,i,c,mask) for (x,y,p,i,c,mask) in zip(tot_X, tot_Y, tot_P, tot_I, tot_C, tot_mask) )
+    else:
+        return ( (x,y,p,mask) for (x,y,p,mask) in zip(tot_X, tot_Y, tot_P, tot_mask) )
+        
+
 
 
 def bach_chorales_classic(mode, transpose=False, maj_min=False, jsf_aug=None):

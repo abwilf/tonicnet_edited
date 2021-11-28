@@ -1,6 +1,6 @@
 import sys
 from preprocessing.nn_dataset import bach_chorales_classic
-from train.train_nn import train_TonicNet, TonicNet_lr_finder, TonicNet_sanity_test
+from train.train_nn import train_TonicNet, train_Transformer, TonicNet_lr_finder, TonicNet_sanity_test
 from train.train_nn import CrossEntropyTimeDistributedLoss
 from train.models import TonicNet
 from eval.utils import plot_loss_acc_curves, indices_to_stream, smooth_rhythm
@@ -9,7 +9,12 @@ from eval.sample import sample_TonicNet_random
 
 if len(sys.argv) > 1:
     if sys.argv[1] in ['--train', '-t']:
-        train_TonicNet(3000, shuffle_batches=1, train_emb_freq=1, load_path='')
+        if sys.argv[2] == 'tonicnet':
+            print('Training TonicNet')
+            train_TonicNet(60, shuffle_batches=1, train_emb_freq=1, load_path='')
+        else:
+            print('Training Transformer')
+            train_Transformer(60, save_model=False,shuffle_batches=1, load_path='')
 
     elif sys.argv[1] in ['--plot', '-p']:
         plot_loss_acc_curves()

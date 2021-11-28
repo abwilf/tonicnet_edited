@@ -1,6 +1,7 @@
 import time, os
 import math
 import matplotlib.pyplot as plt
+import torch
 from torch import save, set_grad_enabled, sum, max
 from torch import optim, cuda, load, device
 from torch.nn.utils import clip_grad_norm_
@@ -8,11 +9,28 @@ from preprocessing.nn_dataset import get_data_set, TOTAL_BATCHES, TRAIN_BATCHES,
 from train.models import CrossEntropyTimeDistributedLoss
 from train.models import TonicNet, Transformer_Model
 from train.external import RAdam, Lookahead, OneCycleLR
+import json
+import numpy as np
 
 """
 File containing functions which train various neural networks defined in train.models
 """
 
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return json.JSONEncoder.default(self, obj)
+
+def save_json(file_stub, obj):
+    filename = file_stub
+    for k,v in obj.items():
+        if isinstance(v, list):
+            obj[k] = np.array(v)
+            if obj[k].dtype==np.float32:
+                obj[k] = obj[k].astype(np.float64)
+    with open(filename, 'w') as f:
+        json.dump(obj, f, cls=NumpyEncoder, indent=4)
 
 CV_PHASES = ['train', 'val']
 TRAIN_ONLY_PHASES = ['train']
@@ -113,6 +131,15 @@ def train_TonicNet(epochs,
     else:
         phases = TRAIN_ONLY_PHASES
 
+    results = {
+        'all_val_losses': [],
+        'all_val_masked_losses': [],
+        'all_val_tot_losses': [],
+        'all_val_accs': [],
+        'all_val_masked_accs': [],
+        'all_val_tot_accs': []
+    }
+
     for epoch in range(epochs):
         start = time.time()
         pr_interval = 50
@@ -123,11 +150,17 @@ def train_TonicNet(epochs,
 
             count = 0
             batch_count = 0
+            batch_count_masked = 0
+            batch_count_tot = 0
             loss_epoch = 0
-            running_accuray = 0.0
+            loss_epoch_masked = 0
+            loss_epoch_all = 0
+            running_accuracy = 0.0
+            running_masked_acc = 0.0 # eval
+            running_tot_acc = 0.0 # eval
             running_batch_count = 0
-            print_loss_batch = 0  # Reset on print
-            print_acc_batch = 0  # Reset on print
+            print_loss_batch = 0.0  # Reset on print
+            print_acc_batch = 0.0  # Reset on print
 
             print(f'\n\tPHASE: {phase}')
 
@@ -136,8 +169,9 @@ def train_TonicNet(epochs,
             else:
                 model.eval()  # Set model to evaluate mode
 
-            for x, y, psx, i, c in get_data_set(phase, shuffle_batches=shuffle_batches, return_I=1):
-                model.zero_grad()
+            for x, y, psx, i, c, mask in get_data_set(phase, shuffle_batches=shuffle_batches, return_I=1):
+                Y = y
+                model.zero_grad() 
 
                 if phase == 'train' and (epoch > -1 or load_path != ''):
                     if train_emb_freq < 1000:
@@ -149,25 +183,63 @@ def train_TonicNet(epochs,
                     train_emb = False
 
                 with set_grad_enabled(phase == 'train'):
-                    y_hat = model(x, z=i, train_embedding=train_emb)
-                    _, preds = max(y_hat, 2)
-                    loss = criterion(y_hat, y,)
+                    mask = mask.to(torch.int)
+                    y_hat = model(x*mask, z=i*mask.squeeze(), train_embedding=train_emb)
+                    
+                    # training: use only voices that are NOT masked
+                    mask = mask.to(torch.bool)
+                    if phase=='train':
+                        masked_yhat = y_hat.squeeze().masked_select(mask.squeeze()[:,None].expand(-1, y_hat.shape[-1])).reshape(-1, y_hat.shape[-1])[None,:]
+                        masked_y = Y.squeeze().masked_select(mask.squeeze())[None,:]
+                        loss = criterion(masked_yhat, masked_y, )
+                        _, preds = max(masked_yhat, 2)
+                        running_accuracy += sum(preds == masked_y).item()
+                        print_acc_batch += sum(preds == masked_y).item()
+                        loss_epoch += loss.item()
+                        print_loss_batch += loss.item()
+                        batch_count += masked_yhat.shape[1]
+                        running_batch_count += masked_yhat.shape[1]
 
+                    else:
+                        # evaluation: use only the voices that are NOT masked (used for validation selection)
+                        masked_yhat = y_hat.squeeze().masked_select(mask.squeeze()[:,None].expand(-1, y_hat.shape[-1])).reshape(-1, y_hat.shape[-1])[None,:]
+                        masked_y = Y.squeeze().masked_select(mask.squeeze())[None,:]
+                        loss = criterion(masked_yhat, masked_y, )
+                        _, preds = max(masked_yhat, 2)
+                        running_accuracy += sum(preds == masked_y).item()
+                        print_acc_batch += sum(preds == masked_y).item()
+                        loss_epoch += loss.item()
+                        print_loss_batch += loss.item()
+                        batch_count += masked_yhat.shape[1]
+                        running_batch_count += masked_yhat.shape[1]
+                        
+                        # evaluation: use only the voices that ARE masked
+                        mask = ~(mask.reshape(-1))
+                        masked_yhat = y_hat.squeeze().masked_select(mask.squeeze()[:,None].expand(-1, y_hat.shape[-1])).reshape(-1, y_hat.shape[-1])[None,:]
+                        masked_y = Y.squeeze().masked_select(mask.squeeze())[None,:]
+                        loss_masked = criterion(masked_yhat, masked_y)
+                        _, preds = max(masked_yhat, 2)
+                        running_masked_acc += sum(preds == masked_y).item()
+                        loss_epoch_masked += loss_masked.item()
+                        batch_count_masked += masked_yhat.shape[1]
+
+                        # evaluation: use all voices
+                        mask = torch.ones_like(mask)
+                        masked_yhat = y_hat.squeeze().masked_select(mask.squeeze()[:,None].expand(-1, y_hat.shape[-1])).reshape(-1, y_hat.shape[-1])[None,:]
+                        masked_y = Y.squeeze().masked_select(mask.squeeze())[None,:]
+                        loss_all = criterion(masked_yhat, masked_y)
+                        _, preds = max(masked_yhat, 2)
+                        running_tot_acc += sum(preds == masked_y).item()
+                        loss_epoch_all += loss_all.item()
+                        batch_count_tot += masked_yhat.shape[1]
+                    
+                count += 1
                 if phase == 'train':
                     loss.backward()
                     clip_grad_norm_(model.parameters(), 5)
                     optimiser.step()
                     if not sanity_test:
                         scheduler.step()
-
-                loss_epoch += loss.item()
-                print_loss_batch += loss.item()
-                running_accuray += sum(preds == y)
-                print_acc_batch += sum(preds == y)
-
-                count += 1
-                batch_count += x.shape[1]
-                running_batch_count += x.shape[1]
 
                 if lr_range_test:
                     lr_step = optimiser.state_dict()["param_groups"][0]["lr"]
@@ -185,39 +257,47 @@ def train_TonicNet(epochs,
                 # print loss for recent set of batches
                 if count % pr_interval == 0:
                     ave_loss = print_loss_batch/pr_interval
-                    ave_acc = 100 * print_acc_batch.float()/running_batch_count
+                    ave_acc = 100 * float(print_acc_batch)/running_batch_count
                     print_acc_batch = 0
                     running_batch_count = 0
                     print('\t\t[%d] loss: %.3f, acc: %.3f' % (count, ave_loss, ave_acc))
                     print_loss_batch = 0
+                    # break
 
                 if count == num_batches:
                     break
 
             # calculate loss and accuracy for phase
-            ave_loss_epoch = loss_epoch/count
-            epoch_acc = 100 * running_accuray.float() / batch_count
-            print('\tfinished %s phase [%d] loss: %.3f, acc: %.3f' % (phase, epoch + 1, ave_loss_epoch, epoch_acc))
+            if phase=='train':
+                # calculate loss and accuracy for phase
+                ave_loss_epoch = loss_epoch/count
+                epoch_acc = 100 * float(running_accuracy) / batch_count
+                print('\tfinished %s phase [%d] loss: %.3f, acc: %.3f' % (phase, epoch + 1, ave_loss_epoch, epoch_acc))
+            else:
+                # not masked
+                val_loss = loss_epoch/count
+                epoch_acc = 100 * float(running_accuracy) / batch_count
 
-        print('\n\ttime:', __time_since(start), '\n')
+                # masked
+                val_loss_masked = loss_epoch_masked/count
+                epoch_acc_masked = 100 * float(running_masked_acc) / batch_count_masked
 
-        # save model when validation loss improves
-        if ave_loss_epoch < best_val_loss:
-            best_val_loss = ave_loss_epoch
-            print("\tNEW BEST LOSS: %.3f" % ave_loss_epoch, '\n')
+                # all
+                val_loss_all = loss_epoch_all/count
+                epoch_acc_all = 100 * float(running_tot_acc) / batch_count_tot
 
-            if save_model:
-                __save_model(epoch, ave_loss_epoch, model, "TonicNet", epoch_acc)
-        else:
-            print("\tLOSS DID NOT IMPROVE FROM %.3f" % best_val_loss, '\n')
+                results['all_val_losses'].append(val_loss)
+                results['all_val_masked_losses'].append(val_loss_masked)
+                results['all_val_tot_losses'].append(val_loss_all)
+                results['all_val_accs'].append(epoch_acc)
+                results['all_val_masked_accs'].append(epoch_acc_masked)
+                results['all_val_tot_accs'].append(epoch_acc_all)
 
-    print("DONE")
-    if lr_range_test:
-        plt.plot(lr_find_lr, lr_find_loss)
-        plt.xscale('log')
-        plt.grid('true')
-        plt.savefig('lr_finder.png')
-        plt.show()
+                print(f'\t Validation perf (on train subset of features): {val_loss:.3f}, {epoch_acc:.3f}')
+                print(f'\t Validation perf (on masked subset): {val_loss_masked:.3f}, {epoch_acc_masked:.3f}')
+                print(f'\t Validation perf (on total subset): {val_loss_all:.3f}, {epoch_acc_all:.3f}')
+
+    save_json('tonicnet_results.json', results)
 
 
 # MARK:- Transformer
@@ -313,6 +393,15 @@ def train_Transformer(epochs,
     else:
         phases = TRAIN_ONLY_PHASES
 
+    results = {
+        'all_val_losses': [],
+        'all_val_masked_losses': [],
+        'all_val_tot_losses': [],
+        'all_val_accs': [],
+        'all_val_masked_accs': [],
+        'all_val_tot_accs': []
+    }
+
     for epoch in range(epochs):
         start = time.time()
         pr_interval = 50
@@ -324,11 +413,17 @@ def train_Transformer(epochs,
             model.zero_grad()
             count = 0
             batch_count = 0
+            batch_count_masked = 0
+            batch_count_tot = 0
             loss_epoch = 0
-            running_accuray = 0.0
+            loss_epoch_masked = 0
+            loss_epoch_all = 0
+            running_accuracy = 0.0
+            running_masked_acc = 0.0 # eval
+            running_tot_acc = 0.0 # eval
             running_batch_count = 0
-            print_loss_batch = 0  # Reset on print
-            print_acc_batch = 0  # Reset on print
+            print_loss_batch = 0.0  # Reset on print
+            print_acc_batch = 0.0  # Reset on print
 
             print(f'\n\tPHASE: {phase}')
 
@@ -337,32 +432,69 @@ def train_Transformer(epochs,
             else:
                 model.eval()  # Set model to evaluate mode
 
-            for x, y, psx, i, c in get_data_set(phase, shuffle_batches=shuffle_batches, return_I=1):
-
+            for x, y, psx, i, c, mask in get_data_set(phase, shuffle_batches=shuffle_batches, return_I=1):
                 Y = y
                 model.seq_len = x.shape[1]
 
                 with set_grad_enabled(phase == 'train'):
-                    y_hat = model(x, psx)
+                    # MASK input - turn into zeros where mask 
+                    mask = mask.to(torch.int)
+                    y_hat = model(x*mask, psx*mask.squeeze(-1))
                     y_hat = y_hat.view(1, -1, N_TOKENS)
-                    _, preds = max(y_hat, 2)
-                    loss = criterion(y_hat, Y, )
+                    
+                    # training: use only voices that are NOT masked
+                    mask = mask.to(torch.bool)
+                    if phase=='train':
+                        masked_yhat = y_hat.squeeze().masked_select(mask.squeeze()[:,None].expand(-1, y_hat.shape[-1])).reshape(-1, y_hat.shape[-1])[None,:]
+                        masked_y = Y.squeeze().masked_select(mask.squeeze())[None,:]
+                        loss = criterion(masked_yhat, masked_y, )
+                        _, preds = max(masked_yhat, 2)
+                        running_accuracy += sum(preds == masked_y).item()
+                        print_acc_batch += sum(preds == masked_y).item()
+                        loss_epoch += loss.item()
+                        print_loss_batch += loss.item()
+                        batch_count += masked_yhat.shape[1]
+                        running_batch_count += masked_yhat.shape[1]
+
+                    else:
+                        # evaluation: use only the voices that are NOT masked (used for validation selection)
+                        masked_yhat = y_hat.squeeze().masked_select(mask.squeeze()[:,None].expand(-1, y_hat.shape[-1])).reshape(-1, y_hat.shape[-1])[None,:]
+                        masked_y = Y.squeeze().masked_select(mask.squeeze())[None,:]
+                        loss = criterion(masked_yhat, masked_y, )
+                        _, preds = max(masked_yhat, 2)
+                        running_accuracy += sum(preds == masked_y).item()
+                        print_acc_batch += sum(preds == masked_y).item()
+                        loss_epoch += loss.item()
+                        print_loss_batch += loss.item()
+                        batch_count += masked_yhat.shape[1]
+                        running_batch_count += masked_yhat.shape[1]
+                        
+                        # evaluation: use only the voices that ARE masked
+                        mask = ~(mask.reshape(-1))
+                        masked_yhat = y_hat.squeeze().masked_select(mask.squeeze()[:,None].expand(-1, y_hat.shape[-1])).reshape(-1, y_hat.shape[-1])[None,:]
+                        masked_y = Y.squeeze().masked_select(mask.squeeze())[None,:]
+                        loss_masked = criterion(masked_yhat, masked_y)
+                        _, preds = max(masked_yhat, 2)
+                        running_masked_acc += sum(preds == masked_y).item()
+                        loss_epoch_masked += loss_masked.item()
+                        batch_count_masked += masked_yhat.shape[1]
+
+                        # evaluation: use all voices
+                        mask = torch.ones_like(mask)
+                        masked_yhat = y_hat.squeeze().masked_select(mask.squeeze()[:,None].expand(-1, y_hat.shape[-1])).reshape(-1, y_hat.shape[-1])[None,:]
+                        masked_y = Y.squeeze().masked_select(mask.squeeze())[None,:]
+                        loss_all = criterion(masked_yhat, masked_y)
+                        _, preds = max(masked_yhat, 2)
+                        running_tot_acc += sum(preds == masked_y).item()
+                        loss_epoch_all += loss_all.item()
+                        batch_count_tot += masked_yhat.shape[1]
+
                     if phase_loss is None:
                         phase_loss = loss
                     else:
                         phase_loss += loss
 
-                loss_epoch += loss.item()
-                print_loss_batch += loss.item()
-
-                len_batch = model.seq_len
-
-                running_accuray += sum(preds == Y)
-                print_acc_batch += sum(preds == Y)
-
                 count += 1
-                batch_count += len_batch
-                running_batch_count += len_batch
 
                 if count % 1 == 0:
                     if phase == 'train':
@@ -391,39 +523,49 @@ def train_Transformer(epochs,
                 # print loss for recent set of batches
                 if count % pr_interval == 0:
                     ave_loss = print_loss_batch/pr_interval
-                    ave_acc = 100 * print_acc_batch.float()/running_batch_count
+                    ave_acc = 100 * print_acc_batch/running_batch_count
                     print_acc_batch = 0
                     running_batch_count = 0
                     print('\t\t[%d] loss: %.3f, acc: %.3f' % (count, ave_loss, ave_acc))
                     print_loss_batch = 0
+                    # break
 
                 if count == num_batches:
                     break
 
-            # calculate loss and accuracy for phase
-            ave_loss_epoch = loss_epoch/count
-            epoch_acc = 100 * running_accuray.float() / batch_count
-            print('\tfinished %s phase [%d] loss: %.3f, acc: %.3f' % (phase, epoch + 1, ave_loss_epoch, epoch_acc))
+            if phase=='train':
+                # calculate loss and accuracy for phase
+                ave_loss_epoch = loss_epoch/count
+                epoch_acc = 100 * float(running_accuracy) / batch_count
+                print('\tfinished %s phase [%d] loss: %.3f, acc: %.3f' % (phase, epoch + 1, ave_loss_epoch, epoch_acc))
+            else:
+                # not masked
+                val_loss = loss_epoch/count
+                epoch_acc = 100 * float(running_accuracy) / batch_count
+                
+                # masked
+                val_loss_masked = loss_epoch_masked/count
+                epoch_acc_masked = 100 * float(running_masked_acc) / batch_count_masked
+
+                # all
+                val_loss_all = loss_epoch_all/count
+                epoch_acc_all = 100 * float(running_tot_acc) / batch_count_tot
+
+                results['all_val_losses'].append(val_loss)
+                results['all_val_masked_losses'].append(val_loss_masked)
+                results['all_val_tot_losses'].append(val_loss_all)
+                results['all_val_accs'].append(epoch_acc)
+                results['all_val_masked_accs'].append(epoch_acc_masked)
+                results['all_val_tot_accs'].append(epoch_acc_all)
+
+                print(f'\t Validation perf (on train subset of features): {val_loss:.3f}, {epoch_acc:.3f}')
+                print(f'\t Validation perf (on masked subset): {val_loss_masked:.3f}, {epoch_acc_masked:.3f}')
+                print(f'\t Validation perf (on total subset): {val_loss_all:.3f}, {epoch_acc_all:.3f}')
 
         print('\n\ttime:', __time_since(start), '\n')
 
-        # save model when validation loss improves
-        if ave_loss_epoch < best_val_loss:
-            best_val_loss = ave_loss_epoch
-            print("\tNEW BEST LOSS: %.3f" % ave_loss_epoch, '\n')
 
-            if save_model:
-                __save_model(epoch, ave_loss_epoch, model, "EncoReTransformer", epoch_acc)
-        else:
-            print("\tLOSS DID NOT IMPROVE FROM %.3f" % best_val_loss, '\n')
-
-    print("DONE")
-    if lr_range_test:
-        plt.plot(lr_find_lr, lr_find_loss)
-        plt.xscale('log')
-        plt.grid('true')
-        plt.savefig('lr_finder.png')
-        plt.show()
+    save_json('transformer_results.json', results)
 
 
 def __save_model(epoch, ave_loss_epoch, model, model_name, acc):
